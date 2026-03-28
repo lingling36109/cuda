@@ -13,7 +13,7 @@ run_matrix() {
     echo
 }
 
-module load cudatoolkit/13.0
+module load cudatoolkit/12.9
 
 run_matrix nlpkkt120 64
 run_matrix nlpkkt120 256
