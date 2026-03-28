@@ -1,6 +1,6 @@
 # Homework 5: Sparse-Dense Matrix Multiply (SpMM) with CUDA #
 
-## Introduction ## 
+# Introduction #
 
 Sparse-Dense Matrix Multiply (SpMM) is a sparse linear algebra primitive that multiplies a sparse matrix $A \in \mathbb{R}^{m \times n}$ with a dense matrix $X \in \mathbb{R}^{n \times k}$, producing a dense output matrix $Y \in \mathbb{R}^{m \times k}$. In other words, we compute 
 $$
@@ -15,6 +15,31 @@ Your kernel will be benchmarked on three large sparse matrices with different sp
 For each matrix, the attained computational throughput (GFLOPS/s) of your SpMM kernel will be measured.
 The goal is to implement a kernel that achieves a high throughput on all three sparse matrices.
 
+## Due Date: Friday April 17th 2026 at 11:59 PM
+
+# Instructions #
+
+## Setup ##
+
+Clone the [hw5 repo](https://github.com/cs5220-26sp/hw5) on Perlmutter to obtain the starter code. 
+
+The starter code contains the following things:
+
+```
+include/
+├── CSR.hpp        # Defines the CSR (Compressed Sparse Row) class for storing and reading sparse matrices from Matrix Market files.
+├── colors.h       # Defines ANSI escape code macros for colored terminal output.
+├── common.h       # Aggregates common C++/CUDA headers and defines error-checking macros for CUDA and cuSPARSE calls.
+├── spmm.cuh       # Contains the SpMM kernel and wrapper function that you will implement.
+└── utils.cuh      # Provides utility functions for printing/writing device buffers and applying element-wise transforms.
+
+tests/
+├── test_common.h  # Provides testing utilities including random matrix initialization, GPU timer functions, and GFLOPS measurement.
+└── test_spmm.cu   # Driver program that checks your SpMM kernel for correctness against cuSPARSE and benchmarks its throughput.
+
+get_matrices.sh    # Downloads and extracts the three benchmark sparse matrices from the SuiteSparse Matrix Collection.
+run.sh             # SLURM batch script that runs the test_spmm benchmark on all three matrices with k=64 and k=256 on Perlmutter.
+```
 
 ## Build Instructions ##
 To build the driver program, run the following
@@ -59,27 +84,50 @@ To fetch a specific matrix from SuiteSparse, left-click the `Matrix Market` butt
 Your grade out of 100 points will be based on the following things:
 
 - 10/100: Checkpoint
-- 70/100: Performance
+- 60/100: Performance
 - 10/100: Leaderboard Submission
 - 20/100: Writeup
 
-### Checkpoint ### 
+### Checkpoint: Due on April 9th, 11:59 PM EST ### 
 
-Your code must produce correct results for all three matrices to pass the checkpoint.
+To pass the checkpoint, your code must produce correct results for all test matrices.
+`test_spmm.cu` will automatically run a correctness check against the SpMM function in the cuSPARSE library, so you don't have to set up correctness tests.
 
 ### Performance
 
-Your GFLOPS/s will be computed on all three matrices for $k=64, 256$ and averaged. That will represent your final performance metric. If you get an average of at least TODO GFLOPS/s, you'll get at least a B+ on the performance part of your grade. Beyond that you'll be graded on a curve based on performance relative to the other students in the class. 
+Your GFLOPS/s will be computed on all three matrices for $k=64, 256$ and averaged. That will represent your final performance metric. If you get an average of **at least 350 GFLOPS/s**, you'll get at least a B+ on the performance part of your grade. Beyond that you'll be graded on a curve based on performance relative to the other students in the class. 
 
 ### Leaderboard
 
 There will be a leaderboard, it is still under construction, but it will function the same as the leaderboard in HW3 and HW4. 
 You'll be ranked on the leaderboard based off of your average GFLOPS/s across all three test matrices and the two test values of `k`. 
+To get the 10 Leaderboard Submission points, we ask that you submit at least once to the leaderboard before the final deadline of April 17th.
 
 ### Writeup ### 
 
-Writeup needs a bar plot with one collection of bars per matrix showing the GFLOPS/s of your kernel on each matrix relative to the GFLOPS/s attained by cuSPARSE SpMM. 
-There should be a short caption describing the plot. 
+The writeup needs a bar plot with one collection of bars per matrix showing the GFLOPS/s of your kernel on each matrix relative to the GFLOPS/s attained by cuSPARSE SpMM. 
+See the recitation slides for an example. 
+There should also be a horizontal dotted line showing peak theoretical FP32 throughput on an A100 GPU.
+Please include a short caption describing the plot as well.
+
+## Submission Details 
+
+1. Make sure you have our most updated source code on Perlmutter.
+
+2. Make sure you have only modified the file `spmm.cuh`.
+
+3. Ensure that your write-up pdf is located in the project root. It should be named CS5220GROUPNO_hw5.pdf. 
+
+4. From your build directory, run:
+```
+student@perlmutter:~/hw5/build> cmake -DGROUP_NO=004..
+student@perlmutter:~/hw5/build> make package
+```
+This second command will fail if the PDF is not present.
+
+5. Download and submit your .tar.gz through canvas. 
+
+You should follow this process for the checkpoint and for the final submission.
 
 ## Implementation Guide ##
 
@@ -141,4 +189,5 @@ These are some optional references you can look at for inspiration/more informat
 * [cuSPARSE SpMM API](https://docs.nvidia.com/cuda/cusparse/#cusparsespmm)
 
 * [Yang, Carl, Aydın Buluç, and John D. Owens. "Design principles for sparse matrix multiplication on the gpu." European Conference on Parallel Processing. Cham: Springer International Publishing, 2018.](https://arxiv.org/pdf/1803.08601)
+
 
