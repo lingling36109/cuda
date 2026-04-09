@@ -8,7 +8,7 @@ namespace spmm {
 
 __global__ void SpMM(const size_t m, const size_t n, const size_t k,
                      float * d_A_vals, uint32_t * d_A_colinds, uint32_t * d_A_rowptrs,
-                     __constant__ float * d_X, float * d_Y)
+                     const float * d_X, float * d_Y)
 {
     size_t row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= m) return;
