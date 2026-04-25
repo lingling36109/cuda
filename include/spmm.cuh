@@ -3,7 +3,6 @@
 
 #include <vector>
 #include <algorithm>
-#include <utility>
 #include "common.h"
 #include "CSR.hpp"
 
@@ -125,7 +124,7 @@ __global__ void SpMM_short(const size_t n_rows,
     const int lane_in_warp = tid & 31;
     const int sub_in_warp  = lane_in_warp / W_S;
     const int lane         = lane_in_warp % W_S;
-    const int sub_in_block = warp_id * SUBS_PER_WARP + sub_in_warp;
+    const int sub_in_block  = warp_id * SUBS_PER_WARP + sub_in_warp;
 
     const size_t local_row = (size_t)blockIdx.x * (blockDim.x / W_S) + sub_in_block;
     if (local_row >= n_rows) return;
@@ -204,35 +203,37 @@ __global__ void SpMM_short(const size_t n_rows,
 
 
 // ----------------------------------------------------------------------------
-// Kernel C: long-row k-partition (Cube_Coup_dt0 style, k=256).
-// One block per row; N_WARPS warps each own a contiguous slice of k columns.
-// All warps walk the row's nnz in lockstep (each warp shuffles its own
-// (val, colind) chunk - L1 absorbs the redundant CSR loads).
-// No SMEM reduction needed: each lane writes its own slice of Y.
+// Kernel C: multi-CTA long-row k-partition for k=256.
+// Each row is split across multiple CTAs by k-slice.  Each CTA still walks the
+// full CSR nnz stream for that row, but it only computes its own contiguous
+// slice of output columns.  This adds launch-level parallelism without atomics.
 // ----------------------------------------------------------------------------
-template <int VW, int N_WARPS>
-__global__ void SpMM_long_kpart(const size_t n_rows,
-                                const uint32_t * __restrict__ row_ids,
-                                const float * __restrict__ A_vals,
-                                const uint32_t * __restrict__ A_colinds,
-                                const uint32_t * __restrict__ A_rowptrs,
-                                const float * __restrict__ X,
-                                float * __restrict__ Y)
+template <int VW, int N_WARPS_PER_CTA, int CTAS_PER_ROW>
+__global__ void SpMM_long_kpart_multiCTA(const size_t n_rows,
+                                         const uint32_t * __restrict__ row_ids,
+                                         const float * __restrict__ A_vals,
+                                         const uint32_t * __restrict__ A_colinds,
+                                         const uint32_t * __restrict__ A_rowptrs,
+                                         const float * __restrict__ X,
+                                         float * __restrict__ Y)
 {
     constexpr int W = 32;
-    constexpr int K_PER_WARP = W * VW;
-    constexpr int K_TOTAL = K_PER_WARP * N_WARPS;
+    constexpr int K_PER_CTA = W * VW * N_WARPS_PER_CTA;
+    constexpr int K_TOTAL    = K_PER_CTA * CTAS_PER_ROW;
 
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
 
-    if (blockIdx.x >= n_rows) return;
-    const uint32_t row = row_ids[blockIdx.x];
+    const size_t row_local = blockIdx.x / CTAS_PER_ROW;
+    const int cta_in_row   = blockIdx.x % CTAS_PER_ROW;
+    if (row_local >= n_rows) return;
+
+    const uint32_t row = row_ids[row_local];
 
     const uint32_t row_start = A_rowptrs[row];
     const uint32_t row_end   = A_rowptrs[row + 1];
 
-    const int col_off = warp * K_PER_WARP + lane * VW;
+    const int col_off = cta_in_row * K_PER_CTA + warp * W * VW + lane * VW;
 
     float acc[VW];
     #pragma unroll
@@ -315,21 +316,18 @@ __global__ void SpMM_thread_row(const size_t m, const size_t k,
 
 
 // ----------------------------------------------------------------------------
-// Bucket cache: row IDs partitioned by nnz/row, computed once per matrix.
-// Fast bucket = all rows for k=64, and short+medium rows for k=256.
-// Long bucket = only the true tail rows.
+// Bucket cache: original three-bucket split restored.
 // ----------------------------------------------------------------------------
 struct BucketCache {
     const uint32_t * key_rowptrs = nullptr;
     size_t key_m = 0;
     size_t key_nnz = 0;
-    size_t key_k = 0;
-
-    uint32_t * d_fast = nullptr;
-    uint32_t * d_long = nullptr;
-
-    size_t n_fast = 0;
-    size_t n_long = 0;
+    uint32_t * d_short = nullptr;
+    uint32_t * d_med   = nullptr;
+    uint32_t * d_long  = nullptr;
+    size_t n_short = 0;
+    size_t n_med   = 0;
+    size_t n_long  = 0;
 };
 
 inline BucketCache & get_bucket_cache() {
@@ -337,30 +335,18 @@ inline BucketCache & get_bucket_cache() {
     return cache;
 }
 
-inline uint32_t choose_long_threshold(const std::vector<uint32_t>& row_nnz, size_t k)
-{
-    if (row_nnz.empty() || k == 64) return 0u;
-
-    std::vector<uint32_t> tmp = row_nnz;
-    const size_t idx = static_cast<size_t>(0.90 * (tmp.size() - 1));
-    std::nth_element(tmp.begin(), tmp.begin() + idx, tmp.end());
-
-    // Conservative cutoff: keep only the heavy tail in the long-row kernel.
-    return std::clamp(tmp[idx], 32u, 128u);
-}
-
-inline void prepare_buckets(csr_t & A, const size_t k)
+inline void prepare_buckets(csr_t & A)
 {
     BucketCache & bc = get_bucket_cache();
     if (bc.key_rowptrs == A.get_rowptrs()
         && bc.key_m == A.get_rows()
-        && bc.key_nnz == A.get_nnz()
-        && bc.key_k == k) {
+        && bc.key_nnz == A.get_nnz()) {
         return;
     }
 
-    if (bc.d_fast) cudaFree(bc.d_fast);
-    if (bc.d_long) cudaFree(bc.d_long);
+    if (bc.d_short) cudaFree(bc.d_short);
+    if (bc.d_med)   cudaFree(bc.d_med);
+    if (bc.d_long)  cudaFree(bc.d_long);
     bc = BucketCache{};
 
     const size_t m = A.get_rows();
@@ -368,26 +354,22 @@ inline void prepare_buckets(csr_t & A, const size_t k)
     CUDA_CHECK(cudaMemcpy(h_rowptrs.data(), A.get_rowptrs(),
                           sizeof(uint32_t) * (m + 1), cudaMemcpyDeviceToHost));
 
+    constexpr uint32_t SHORT_T = 16;
+    constexpr uint32_t LONG_T  = 64;
+
+    std::vector<uint32_t> hs, hm, hl;
+    hs.reserve(m); hm.reserve(m); hl.reserve(m);
+
     std::vector<uint32_t> row_nnz(m);
     for (uint32_t i = 0; i < (uint32_t)m; i++) {
         row_nnz[i] = h_rowptrs[i + 1] - h_rowptrs[i];
     }
 
-    const uint32_t long_t = choose_long_threshold(row_nnz, k);
-
-    std::vector<uint32_t> fast_rows;
-    std::vector<uint32_t> long_rows;
-    fast_rows.reserve(m);
-    long_rows.reserve(m);
-
     for (uint32_t i = 0; i < (uint32_t)m; i++) {
-        const uint32_t nnz_i = row_nnz[i];
-
-        if (k == 64 || nnz_i <= long_t) {
-            fast_rows.push_back(i);
-        } else {
-            long_rows.push_back(i);
-        }
+        uint32_t nnz_i = row_nnz[i];
+        if (nnz_i <= SHORT_T)      hs.push_back(i);
+        else if (nnz_i <= LONG_T)  hm.push_back(i);
+        else                       hl.push_back(i);
     }
 
     auto sort_by_desc_nnz = [&](std::vector<uint32_t>& rows) {
@@ -398,8 +380,9 @@ inline void prepare_buckets(csr_t & A, const size_t k)
                   });
     };
 
-    sort_by_desc_nnz(fast_rows);
-    sort_by_desc_nnz(long_rows);
+    sort_by_desc_nnz(hs);
+    sort_by_desc_nnz(hm);
+    sort_by_desc_nnz(hl);
 
     auto upload = [](const std::vector<uint32_t>& h, uint32_t** dp, size_t& n) {
         n = h.size();
@@ -409,19 +392,18 @@ inline void prepare_buckets(csr_t & A, const size_t k)
                                   cudaMemcpyHostToDevice));
         }
     };
-
-    upload(fast_rows, &bc.d_fast, bc.n_fast);
-    upload(long_rows, &bc.d_long, bc.n_long);
+    upload(hs, &bc.d_short, bc.n_short);
+    upload(hm, &bc.d_med,   bc.n_med);
+    upload(hl, &bc.d_long,  bc.n_long);
 
     bc.key_rowptrs = A.get_rowptrs();
     bc.key_m       = m;
     bc.key_nnz     = A.get_nnz();
-    bc.key_k       = k;
 }
 
 
 // ----------------------------------------------------------------------------
-// Wrapper: bucket rows once per matrix, then dispatch kernels per bucket.
+// Wrapper: restore bucket-specific dispatch and use multi-CTA long-row kernel.
 // ----------------------------------------------------------------------------
 void SpMM_wrapper(csr_t & A, float * d_X, float * d_Y, const size_t k)
 {
@@ -434,7 +416,7 @@ void SpMM_wrapper(csr_t & A, float * d_X, float * d_Y, const size_t k)
         return;
     }
 
-    prepare_buckets(A, k);
+    prepare_buckets(A);
     BucketCache & bc = get_bucket_cache();
 
     float    * vals = A.get_vals();
@@ -442,33 +424,59 @@ void SpMM_wrapper(csr_t & A, float * d_X, float * d_Y, const size_t k)
     uint32_t * rowp = A.get_rowptrs();
 
     if (k == 64) {
-        // All rows use the same 8x8 subwarp kernel, so one sorted launch is best.
-        if (bc.n_fast > 0) {
+        if (bc.n_short > 0) {
             constexpr int W_S = 8;
             constexpr int VW  = 8;
-            constexpr int ROWS_PER_BLOCK = 256 / W_S;  // 32 rows/block
+            constexpr int ROWS_PER_BLOCK = 256 / W_S;  // 32
             dim3 block(256);
-            dim3 grid((bc.n_fast + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+            dim3 grid((bc.n_short + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
             SpMM_short<W_S, VW><<<grid, block>>>(
-                bc.n_fast, bc.d_fast, vals, cols, rowp, d_X, d_Y);
+                bc.n_short, bc.d_short, vals, cols, rowp, d_X, d_Y);
+        }
+
+        if (bc.n_med > 0) {
+            constexpr int VW = 2;
+            constexpr int WARPS = 4;
+            dim3 block(32, WARPS);
+            dim3 grid((bc.n_med + WARPS - 1) / WARPS);
+            SpMM_warp_row<VW><<<grid, block>>>(
+                bc.n_med, bc.d_med, vals, cols, rowp, d_X, d_Y);
+        }
+
+        if (bc.n_long > 0) {
+            constexpr int VW = 2;
+            constexpr int WARPS = 4;
+            dim3 block(32, WARPS);
+            dim3 grid((bc.n_long + WARPS - 1) / WARPS);
+            SpMM_warp_row<VW><<<grid, block>>>(
+                bc.n_long, bc.d_long, vals, cols, rowp, d_X, d_Y);
         }
     } else {  // k == 256
-        // short+medium rows share the same warp-row kernel, so keep them together.
-        if (bc.n_fast > 0) {
+        if (bc.n_short > 0) {
             constexpr int VW = 8;
-            constexpr int WARPS = 8;
+            constexpr int WARPS = 4;
             dim3 block(32, WARPS);
-            dim3 grid((bc.n_fast + WARPS - 1) / WARPS);
+            dim3 grid((bc.n_short + WARPS - 1) / WARPS);
             SpMM_warp_row<VW><<<grid, block>>>(
-                bc.n_fast, bc.d_fast, vals, cols, rowp, d_X, d_Y);
+                bc.n_short, bc.d_short, vals, cols, rowp, d_X, d_Y);
+        }
+
+        if (bc.n_med > 0) {
+            constexpr int VW = 8;
+            constexpr int WARPS = 4;
+            dim3 block(32, WARPS);
+            dim3 grid((bc.n_med + WARPS - 1) / WARPS);
+            SpMM_warp_row<VW><<<grid, block>>>(
+                bc.n_med, bc.d_med, vals, cols, rowp, d_X, d_Y);
         }
 
         if (bc.n_long > 0) {
             constexpr int VW_L = 2;
-            constexpr int N_WARPS = 4;
-            dim3 block(32, N_WARPS);
-            dim3 grid(bc.n_long);
-            SpMM_long_kpart<VW_L, N_WARPS><<<grid, block>>>(
+            constexpr int N_WARPS_PER_CTA = 2;
+            constexpr int CTAS_PER_ROW = 2;
+            dim3 block(32, N_WARPS_PER_CTA);
+            dim3 grid(bc.n_long * CTAS_PER_ROW);
+            SpMM_long_kpart_multiCTA<VW_L, N_WARPS_PER_CTA, CTAS_PER_ROW><<<grid, block>>>(
                 bc.n_long, bc.d_long, vals, cols, rowp, d_X, d_Y);
         }
     }
@@ -476,5 +484,5 @@ void SpMM_wrapper(csr_t & A, float * d_X, float * d_Y, const size_t k)
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-}
+} // namespace spmm
 #endif
