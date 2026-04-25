@@ -176,6 +176,24 @@ __global__ void SpMM_short(const size_t n_rows,
                 acc[2] += val_b * a.z; acc[3] += val_b * a.w;
                 acc[4] += val_b * b.x; acc[5] += val_b * b.y;
                 acc[6] += val_b * b.z; acc[7] += val_b * b.w;
+            } else if constexpr (VW == 16) {
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    float4 f = *reinterpret_cast<const float4*>(xrow + i*4);
+                    acc[i*4+0] += val_b * f.x;
+                    acc[i*4+1] += val_b * f.y;
+                    acc[i*4+2] += val_b * f.z;
+                    acc[i*4+3] += val_b * f.w;
+                }
+            } else if constexpr (VW == 32) {
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    float4 f = *reinterpret_cast<const float4*>(xrow + i*4);
+                    acc[i*4+0] += val_b * f.x;
+                    acc[i*4+1] += val_b * f.y;
+                    acc[i*4+2] += val_b * f.z;
+                    acc[i*4+3] += val_b * f.w;
+                }
             } else {
                 #pragma unroll
                 for (int v = 0; v < VW; v++) acc[v] += val_b * xrow[v];
@@ -195,6 +213,18 @@ __global__ void SpMM_short(const size_t n_rows,
         float4 b{acc[4], acc[5], acc[6], acc[7]};
         *reinterpret_cast<float4*>(yrow)     = a;
         *reinterpret_cast<float4*>(yrow + 4) = b;
+    } else if constexpr (VW == 16) {
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            float4 r{acc[i*4+0], acc[i*4+1], acc[i*4+2], acc[i*4+3]};
+            *reinterpret_cast<float4*>(yrow + i*4) = r;
+        }
+    } else if constexpr (VW == 32) {
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            float4 r{acc[i*4+0], acc[i*4+1], acc[i*4+2], acc[i*4+3]};
+            *reinterpret_cast<float4*>(yrow + i*4) = r;
+        }
     } else {
         #pragma unroll
         for (int v = 0; v < VW; v++) yrow[v] = acc[v];
@@ -414,36 +444,27 @@ void SpMM_wrapper(csr_t & A, float * d_X, float * d_Y, const size_t k)
             nrows, rows, vals, cols, rowp, d_X, d_Y);
     };
 
+    auto launch_k256_bucket = [&](const uint32_t *rows, size_t nrows) {
+        if (nrows == 0) return;
+        constexpr int W_S = 8;
+        constexpr int VW  = 32;
+        constexpr int ROWS_PER_BLOCK = 128 / W_S;  // 16 rows/block
+        dim3 block(128);
+        dim3 grid((nrows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+        SpMM_short<W_S, VW><<<grid, block>>>(
+            nrows, rows, vals, cols, rowp, d_X, d_Y);
+    };
+
     if (k == 64) {
         // Use one vectorized 8x8 subwarp kernel for every bucket.
         launch_k64_bucket(bc.d_short, bc.n_short);
         launch_k64_bucket(bc.d_med,   bc.n_med);
         launch_k64_bucket(bc.d_long,  bc.n_long);
     } else {  // k == 256
-        if (bc.n_short > 0) {
-            constexpr int VW = 8;
-            constexpr int WARPS = 4;
-            dim3 block(32, WARPS);
-            dim3 grid((bc.n_short + WARPS - 1) / WARPS);
-            SpMM_warp_row<VW><<<grid, block>>>(
-                bc.n_short, bc.d_short, vals, cols, rowp, d_X, d_Y);
-        }
-        if (bc.n_med > 0) {
-            constexpr int VW = 8;
-            constexpr int WARPS = 4;
-            dim3 block(32, WARPS);
-            dim3 grid((bc.n_med + WARPS - 1) / WARPS);
-            SpMM_warp_row<VW><<<grid, block>>>(
-                bc.n_med, bc.d_med, vals, cols, rowp, d_X, d_Y);
-        }
-        if (bc.n_long > 0) {
-            constexpr int VW_L = 2;
-            constexpr int N_WARPS = 4;
-            dim3 block(32, N_WARPS);
-            dim3 grid(bc.n_long);
-            SpMM_long_kpart<VW_L, N_WARPS><<<grid, block>>>(
-                bc.n_long, bc.d_long, vals, cols, rowp, d_X, d_Y);
-        }
+        // Unified 8x32 subwarp kernel: 4 rows per warp, 32 cols per lane.
+        launch_k256_bucket(bc.d_short, bc.n_short);
+        launch_k256_bucket(bc.d_med,   bc.n_med);
+        launch_k256_bucket(bc.d_long,  bc.n_long);
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
