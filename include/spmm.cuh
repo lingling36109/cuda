@@ -436,8 +436,8 @@ void SpMM_wrapper(csr_t & A, float * d_X, float * d_Y, const size_t k)
     uint32_t * rowp = A.get_rowptrs();
 
     // Dense-regular gate: matrices with mean nnz/row >= 40 (e.g. Cube_Coup_dt0
-    // at 58.7) benefit from wider sub-warps at k=64 and 2-warp k-partition at
-    // k=256. nlpkkt120 (~27) and delaunay_n24 (~6) stay on the existing path.
+    // at 58.7) get an extended LONG kernel for MED rows at k=256.
+    // nlpkkt120 (~27) and delaunay_n24 (~6) stay on the existing path.
     const bool dense_regular = bc.mean_nnz >= 40.0;
 
     auto launch_k64_bucket = [&](const uint32_t *rows, size_t nrows) {
@@ -451,21 +451,10 @@ void SpMM_wrapper(csr_t & A, float * d_X, float * d_Y, const size_t k)
             nrows, rows, vals, cols, rowp, d_X, d_Y);
     };
 
-    auto launch_k64_dense = [&](const uint32_t *rows, size_t nrows) {
+    auto launch_k256_long_kpart = [&](const uint32_t *rows, size_t nrows) {
         if (nrows == 0) return;
-        constexpr int W_S = 16;
-        constexpr int VW  = 4;
-        constexpr int ROWS_PER_BLOCK = 128 / W_S;  // 8 rows/block
-        dim3 block(128);
-        dim3 grid((nrows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
-        SpMM_short<W_S, VW><<<grid, block>>>(
-            nrows, rows, vals, cols, rowp, d_X, d_Y);
-    };
-
-    auto launch_k256_dense_long = [&](const uint32_t *rows, size_t nrows) {
-        if (nrows == 0) return;
-        constexpr int VW_L = 4;
-        constexpr int N_WARPS = 2;
+        constexpr int VW_L = 2;
+        constexpr int N_WARPS = 4;
         dim3 block(32, N_WARPS);
         dim3 grid(nrows);
         SpMM_long_kpart<VW_L, N_WARPS><<<grid, block>>>(
@@ -473,17 +462,10 @@ void SpMM_wrapper(csr_t & A, float * d_X, float * d_Y, const size_t k)
     };
 
     if (k == 64) {
-        if (dense_regular) {
-            // Cube_Coup_dt0: route MED+LONG through wider 16-lane sub-warps.
-            launch_k64_bucket(bc.d_short, bc.n_short);
-            launch_k64_dense (bc.d_med,   bc.n_med);
-            launch_k64_dense (bc.d_long,  bc.n_long);
-        } else {
-            // Use one vectorized 8x8 subwarp kernel for every bucket.
-            launch_k64_bucket(bc.d_short, bc.n_short);
-            launch_k64_bucket(bc.d_med,   bc.n_med);
-            launch_k64_bucket(bc.d_long,  bc.n_long);
-        }
+        // k=64 path is unchanged for all matrices (baseline already well-tuned).
+        launch_k64_bucket(bc.d_short, bc.n_short);
+        launch_k64_bucket(bc.d_med,   bc.n_med);
+        launch_k64_bucket(bc.d_long,  bc.n_long);
     } else {  // k == 256
         // Short rows: warp-per-row with VW=8 (32 lanes x 8 cols). Same in both paths.
         if (bc.n_short > 0) {
@@ -495,9 +477,10 @@ void SpMM_wrapper(csr_t & A, float * d_X, float * d_Y, const size_t k)
                 bc.n_short, bc.d_short, vals, cols, rowp, d_X, d_Y);
         }
         if (dense_regular) {
-            // Cube_Coup_dt0: 2-warp k-partition with VW=4 (each warp owns 128 cols).
-            launch_k256_dense_long(bc.d_med,  bc.n_med);
-            launch_k256_dense_long(bc.d_long, bc.n_long);
+            // Cube_Coup_dt0: extend the 4-warp k-partition kernel to MED rows
+            // (their ~32-58 nnz still benefit from K-parallelism across 4 warps).
+            launch_k256_long_kpart(bc.d_med,  bc.n_med);
+            launch_k256_long_kpart(bc.d_long, bc.n_long);
         } else {
             if (bc.n_med > 0) {
                 constexpr int VW = 8;
@@ -508,14 +491,7 @@ void SpMM_wrapper(csr_t & A, float * d_X, float * d_Y, const size_t k)
                     bc.n_med, bc.d_med, vals, cols, rowp, d_X, d_Y);
             }
             // Long rows: 4-warp k-partition (each warp owns 64 cols, lane VW=2).
-            if (bc.n_long > 0) {
-                constexpr int VW_L = 2;
-                constexpr int N_WARPS = 4;
-                dim3 block(32, N_WARPS);
-                dim3 grid(bc.n_long);
-                SpMM_long_kpart<VW_L, N_WARPS><<<grid, block>>>(
-                    bc.n_long, bc.d_long, vals, cols, rowp, d_X, d_Y);
-            }
+            launch_k256_long_kpart(bc.d_long, bc.n_long);
         }
     }
 
