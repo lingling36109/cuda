@@ -404,8 +404,6 @@ void SpMM_wrapper(csr_t & A, float * d_X, float * d_Y, const size_t k)
     uint32_t * rowp = A.get_rowptrs();
 
     if (k == 64) {
-        // Short rows: sub-warp W_S=8, VW=8 -> 4 sub-warps per warp,
-        // 4 warps per block -> 16 rows per block.
         if (bc.n_short > 0) {
             constexpr int W_S = 8;
             constexpr int VW  = 8;
@@ -415,7 +413,6 @@ void SpMM_wrapper(csr_t & A, float * d_X, float * d_Y, const size_t k)
             SpMM_short<W_S, VW><<<grid, block>>>(
                 bc.n_short, bc.d_short, vals, cols, rowp, d_X, d_Y);
         }
-        // Medium and long rows: warp-per-row, VW=2.
         if (bc.n_med > 0) {
             constexpr int VW = 2;
             constexpr int WARPS = 4;
@@ -433,7 +430,6 @@ void SpMM_wrapper(csr_t & A, float * d_X, float * d_Y, const size_t k)
                 bc.n_long, bc.d_long, vals, cols, rowp, d_X, d_Y);
         }
     } else {  // k == 256
-        // Short and medium rows: warp-per-row, VW=8.
         if (bc.n_short > 0) {
             constexpr int VW = 8;
             constexpr int WARPS = 4;
@@ -450,7 +446,6 @@ void SpMM_wrapper(csr_t & A, float * d_X, float * d_Y, const size_t k)
             SpMM_warp_row<VW><<<grid, block>>>(
                 bc.n_med, bc.d_med, vals, cols, rowp, d_X, d_Y);
         }
-        // Long rows: 4-warp k-partition (each warp owns 64 cols, lane VW=2).
         if (bc.n_long > 0) {
             constexpr int VW_L = 2;
             constexpr int N_WARPS = 4;
